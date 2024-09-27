@@ -28,6 +28,9 @@ const app = new App({
 
 // Path to the leaderboard file
 const LEADERBOARD_FILE = 'leaderboard.json';
+// Path to the chat history file
+const CHAT_HISTORY_FILE = 'chat_history.json';
+const MAX_CHAT_HISTORY = 1000;
 
 // Function to read the leaderboard from the file
 async function readLeaderboard(): Promise<{ [key: string]: number }> {
@@ -72,59 +75,175 @@ async function writeLeaderboard(leaderboard: { [key: string]: number }): Promise
   }
 }
 
-// Function to parse user messages using OpenAI
-async function parseMessage(messageText: string): Promise<any> {
-  const systemPrompt = `
-You are an assistant that extracts intents and entities from user messages related to a Magic: The Gathering leaderboard.
-The possible intents are:
+// Function to read the chat history from the file
+async function readChatHistory(): Promise<any[]> {
+  try {
+    // Lock the file for reading
+    await lockfile.lock(CHAT_HISTORY_FILE, { retries: 5 });
 
-- ShowLeaderboard
-- RecordGame
+    if (!fs.existsSync(CHAT_HISTORY_FILE)) {
+      // If file doesn't exist, return an empty array
+      return [];
+    }
 
-For RecordGame, the entities are:
-- players: list of player names
-- winner: name of the winning player
-
-Given a user's message, extract the intent and entities in JSON format.
-
-Response format (in JSON):
-
-{
-  "intent": "ShowLeaderboard" or "RecordGame",
-  "players": ["player1", "player2", ...],  // only for RecordGame
-  "winner": "winner_name"  // only for RecordGame
+    const data = fs.readFileSync(CHAT_HISTORY_FILE, 'utf8');
+    const chatHistory = JSON.parse(data);
+    return chatHistory;
+  } catch (error) {
+    console.error(`Error reading chat history: ${error}`);
+    return [];
+  } finally {
+    // Unlock the file
+    await lockfile.unlock(CHAT_HISTORY_FILE).catch((err) => {
+      console.error(`Error unlocking chat history file: ${err}`);
+    });
+  }
 }
 
-If any information is missing or unclear, set the value to null.
+// Function to write the chat history to the file
+async function writeChatHistory(chatHistory: any[]): Promise<void> {
+  try {
+    // Lock the file for writing
+    await lockfile.lock(CHAT_HISTORY_FILE, { retries: 5 });
 
-Important: Only output the JSON object and nothing else.
-`;
+    const data = JSON.stringify(chatHistory, null, 2);
+    fs.writeFileSync(CHAT_HISTORY_FILE, data, 'utf8');
+  } catch (error) {
+    console.error(`Error writing chat history: ${error}`);
+  } finally {
+    // Unlock the file
+    await lockfile.unlock(CHAT_HISTORY_FILE).catch((err) => {
+      console.error(`Error unlocking chat history file: ${err}`);
+    });
+  }
+}
 
+// Function to parse user messages using OpenAI with function calling
+async function parseMessage(messageText: string, chatHistory: any[]): Promise<any> {
   const messages = [
-    { role: 'system' as const, content: systemPrompt },
-    { role: 'user' as const, content: `Message: "${messageText}"` },
+    ...chatHistory,
+    { role: 'user' as const, content: messageText },
+  ];
+
+  // Define the functions for OpenAI to use
+  const functions = [
+    {
+      name: 'show_leaderboard',
+      description: 'Retrieve and display the current leaderboard',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+    {
+      name: 'record_game',
+      description: 'Record the outcome of a game',
+      parameters: {
+        type: 'object',
+        properties: {
+          players: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'List of player names',
+          },
+          winner: {
+            type: 'string',
+            description: 'Name of the winning player',
+          },
+        },
+        required: ['players', 'winner'],
+      },
+    },
   ];
 
   try {
     const response = await openai.chat.completions.create({
-      model: '4o-mini',
+      model: 'gpt-4o-mini',
       messages,
       max_tokens: 200,
       temperature: 0,
+      functions,
+      function_call: 'auto',
     });
 
-    const assistantResponse = response.choices[0].message?.content?.trim();
+    const assistantMessage = response.choices[0].message;
 
-    // Try to parse the response as JSON
-    if (assistantResponse) {
-      const parsedResponse = JSON.parse(assistantResponse);
-      return parsedResponse;
+    // Add assistant's message to chat history
+    if (assistantMessage) {
+      chatHistory.push(assistantMessage);
+    }
+
+    // Save updated chat history (limit to last 1000 messages)
+    if (chatHistory.length > MAX_CHAT_HISTORY) {
+      chatHistory.splice(0, chatHistory.length - MAX_CHAT_HISTORY);
+    }
+    await writeChatHistory(chatHistory);
+
+    if (assistantMessage && assistantMessage.function_call) {
+      return assistantMessage.function_call;
     } else {
       return null;
     }
   } catch (error) {
     console.error(`Error parsing OpenAI response: ${error}`);
     return null;
+  }
+}
+
+// Function to handle the assistant's function call
+async function handleFunctionCall(functionCall: any, say: any) {
+  const functionName = functionCall.name;
+  const functionArgs = JSON.parse(functionCall.arguments);
+
+  if (functionName === 'show_leaderboard') {
+    // Show the leaderboard with formatting
+    const leaderboard = await readLeaderboard();
+    if (Object.keys(leaderboard).length > 0) {
+      const sortedLeaderboard = Object.entries(leaderboard).sort(
+        (a, b) => b[1] - a[1]
+      );
+
+      // Get the highest score to identify top players
+      const highestScore = sortedLeaderboard[0][1];
+
+      const leaderboardText = sortedLeaderboard
+        .map(([player, wins]) => {
+          const isTopPlayer = wins === highestScore;
+          const bulletEmoji = isTopPlayer ? ':crown:' : ':star:';
+          return `${bulletEmoji} *${player}*: ${wins} win${wins !== 1 ? 's' : ''}`;
+        })
+        .join('\n');
+
+      await say(`*Leaderboard:*\n${leaderboardText}`);
+    } else {
+      await say('The leaderboard is currently empty.');
+    }
+  } else if (functionName === 'record_game') {
+    const players: string[] = functionArgs.players;
+    const winner: string = functionArgs.winner;
+
+    if (!players || !winner) {
+      await say("Sorry, I couldn't find the players or winner in your request.");
+      return;
+    }
+    if (!players.includes(winner)) {
+      await say(`The winner *${winner}* is not among the list of players: ${players.join(', ')}.`);
+      return;
+    }
+    // Update the leaderboard
+    const leaderboard = await readLeaderboard();
+    players.forEach((player) => {
+      if (!(player in leaderboard)) {
+        leaderboard[player] = 0;
+      }
+    });
+    leaderboard[winner] += 1;
+    await writeLeaderboard(leaderboard);
+    await say(`:trophy: Game recorded! *${winner}* won the game among ${players.join(', ')}.`);
+  } else {
+    // Do nothing if the function name is not recognized
+    return;
   }
 }
 
@@ -135,53 +254,27 @@ app.message(async ({ message, say }) => {
 
   const text = (message as any).text;
   if (text) {
-    const parsed = await parseMessage(text);
-    if (!parsed) {
-      await say("Sorry, I couldn't understand your request.");
-      return;
+    // Read chat history
+    let chatHistory = await readChatHistory();
+
+    // Add user's message to chat history
+    chatHistory.push({ role: 'user', content: text });
+
+    // Limit chat history to last MAX_CHAT_HISTORY messages
+    if (chatHistory.length > MAX_CHAT_HISTORY) {
+      chatHistory.splice(0, chatHistory.length - MAX_CHAT_HISTORY);
     }
 
-    const intent = parsed.intent;
-    if (intent === 'ShowLeaderboard') {
-      // Show the leaderboard
-      const leaderboard = await readLeaderboard();
-      if (Object.keys(leaderboard).length > 0) {
-        const sortedLeaderboard = Object.entries(leaderboard).sort(
-          (a, b) => b[1] - a[1]
-        );
-        const leaderboardText = sortedLeaderboard
-          .map(([player, wins]) => `${player}: ${wins} wins`)
-          .join('\n');
-        await say(`Leaderboard:\n${leaderboardText}`);
-      } else {
-        await say('The leaderboard is currently empty.');
-      }
-    } else if (intent === 'RecordGame') {
-      const players: string[] = parsed.players;
-      const winner: string = parsed.winner;
-      if (!players || !winner) {
-        await say("Sorry, I couldn't find the players or winner in your request.");
-        return;
-      }
-      if (!players.includes(winner)) {
-        await say(`The winner ${winner} is not among the list of players ${players}.`);
-        return;
-      }
-      // Update the leaderboard
-      const leaderboard = await readLeaderboard();
-      players.forEach((player) => {
-        if (!(player in leaderboard)) {
-          leaderboard[player] = 0;
-        }
-      });
-      leaderboard[winner] += 1;
-      await writeLeaderboard(leaderboard);
-      await say(`Game recorded. ${winner} won the game among ${players.join(', ')}.`);
-    } else {
-      await say("Sorry, I didn't understand your intent.");
+    // Save updated chat history
+    await writeChatHistory(chatHistory);
+
+    const functionCall = await parseMessage(text, chatHistory);
+    if (functionCall) {
+      await handleFunctionCall(functionCall, say);
     }
+    // If there's no function call, the bot remains silent
   } else {
-    await say('Please send a message containing your request.');
+    // Optionally, handle messages with no text
   }
 });
 
